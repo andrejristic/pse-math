@@ -1,0 +1,885 @@
+===============================================================================
+PSE MATHEMATICAL RESEARCH SYSTEM — BUILD SPECIFICATION
+A PSE swarm as a research assistant for open problems in number theory and logic
+Andrej Ristic / ZeravaTech Inc.
+Companion document to: PSE_MASTER_ARCHITECTURE.txt
+===============================================================================
+
+READING NOTE
+  This document does NOT restate the master architecture. It specifies only the
+  DELTA: what changes, what is added, what is dropped, and in what order it gets
+  built. Anything not mentioned here is inherited unchanged from the master spec.
+  Sections marked [PC] contain pseudocode: signatures and core logic only.
+  Sections marked [!] are decisions that are easy to get wrong and expensive to
+  reverse later.
+
+GOAL (stated precisely, so success is checkable)
+  The system is NOT expected to prove Collatz, RH, or twin primes. The deliverable
+  of a successful deployment is one or more of:
+    (a) a formally verified lemma library around a chosen problem,
+    (b) a narrowed constant (e.g. an improved admissible k_0),
+    (c) a NEGATIVE result: a machine-mapped boundary showing which families of
+        auxiliary functions / sieve weights provably cannot reach the target,
+    (d) a reproducible search record showing which strategies paid off and which
+        did not, on which problem shapes.
+  (c) is the most likely first real contribution and the one best suited to a
+  swarm. Design accordingly: the system must be as good at closing doors as at
+  opening them.
+
+
+===============================================================================
+1. DOMAIN MAPPING  (master spec vocabulary -> this deployment)
+===============================================================================
+  patient / cared-for human   ->  the PROBLEM under attack (Collatz, DHL[k,2], ...)
+  clinician / human-in-loop   ->  Andrej (the mathematician)
+  case                        ->  a BRANCH: one line of attack on one problem
+  Organelle Registry          ->  the unit's EARNED LEMMA BASIS (verified,
+                                  load-bearing lemmas it may use without re-proof)
+  Boundary entity             ->  a CANDIDATE LEMMA / claim under consideration
+  Absorption                  ->  promotion of a candidate to the unit's basis
+  SHARED_LIB                  ->  the verified corpus + orchestrator + sole gate
+  Physician                   ->  unchanged (treats pathological units)
+  Guardian 1                  ->  unchanged (cyber defense of the deployment)
+  Guardian 2                  ->  NEW: treats pathological CLAIMS
+  Seldon Engine               ->  strategy fitness across branches and problems
+  Mission                     ->  {state, action, outcome} = {current known bound,
+                                  method being applied, target improvement}
+  Unit death                  ->  branch abandoned; knowledge harvested first
+
+  [!] Human Priority (A5) is REINTERPRETED, not dropped. In this domain the
+  "human" whose welfare is protected is Andrej, and the concrete meaning is:
+  the system may never consume more of his attention than it returns in value.
+  Operationally this is enforced by the single human queue (Sec 10) having a
+  hard daily cap on items. A system that floods the queue has violated A5 just
+  as surely as a clinical unit that ignores its patient.
+
+
+===============================================================================
+2. CONSTANTS — CHANGED, KEPT, ADDED
+===============================================================================
+--- KEPT UNCHANGED (do not touch) -------------------------------------------
+  Healthy sigma_theta            [0.015, 0.03]
+  Schizoid sigma threshold       < 0.01 over the stability window
+  Stability window               10,000 interactions
+  Single-organelle cap           0.20
+  Total organelle budget         0.30
+  Hierarchical composition       (A+B)+C
+  Inherited organelle factor     0.70
+
+--- CHANGED -----------------------------------------------------------------
+  THETA BAND is now PHASE-DEPENDENT, not a single [25,35] window.
+
+    Phase          theta band     meaning
+    -----------    -----------    ---------------------------------------------
+    RECON          [40.00,60.00]  survey literature + sibling branches; mostly
+                                  ingesting. High other-direction is CORRECT here.
+    ASSAULT        [15.00,25.00]  deep push on own line; heavy self-direction.
+                                  A unit stuck at 45 in ASSAULT is reading, not
+                                  working.
+    CONSOLIDATION  [25.00,35.00]  formalize, reconcile with corpus, hand off.
+                                  This is the master-spec band.
+    HUMAN-FACING   [25.00,35.00]  nominal 30.00. NEVER varies. See Sec 11.
+
+  [!] The mean moves; the VARIANCE INVARIANT DOES NOT. sigma_theta in
+  [0.015,0.03] applies in every phase. A unit with flatline theta is not doing
+  research regardless of which band it sits in — it is either grinding one
+  derivation forever (Circle) or generating machinery nothing will ever use
+  (Opening Spiral). This is the single most important transfer from the master
+  spec into this domain, and it is the one that will actually catch failures.
+
+  Phase transitions are SHARED_LIB-controlled (like fission). A unit cannot
+  declare its own phase. Transition triggers:
+    RECON -> ASSAULT         >= 3 candidate lemmas registered at boundary, and
+                             sibling-branch survey returned (no duplicate work)
+    ASSAULT -> CONSOLIDATION >= 1 candidate passes the verification gate, OR
+                             budget 80% consumed with no movement
+    CONSOLIDATION -> RECON   branch continues with a new sub-goal
+    any -> DEATH             mission failure, budget exhaustion, or Null State
+
+--- ADDED -------------------------------------------------------------------
+  VERIFICATION_REQUIRED          True   (hard, non-overridable)
+  ORPHAN_FLAG_AFTER              500 steps with zero dependents
+  HUMAN_QUEUE_DAILY_CAP          12     (A5 enforcement; see Sec 10)
+  DUPLICATE_SIMILARITY_T         0.85   (candidate vs existing corpus lemma)
+  SKEPTIC_BOUNTY_WINDOW          2000   steps during which a later refutation
+                                        still penalizes the accepting skeptic
+  BRANCH_STALL_STEPS             1500   no new verified lemma -> stall review
+  MIN_CASES_FOR_STRATEGY_SHIFT   20     (inherited from master spec, I-7)
+
+
+===============================================================================
+3. SHARED_LIB — THE ONLY AUTHORITY
+===============================================================================
+DESIGN RULE [!]
+  There is exactly one gate in this system and it is inside SHARED_LIB. Guardian 2
+  does not gate. The chat unit does not gate. The GUI does not gate. Every other
+  component produces EVIDENCE; SHARED_LIB alone accepts or rejects, and nothing is
+  persisted that has not been accepted. Any future component that "just needs to
+  write directly" is a second authority appearing by the back door — refuse it.
+
+SHARED_LIB gains four things:
+
+3.1 VERIFICATION SUBSYSTEM (mechanical, binary, cheap, always run)
+  Runs the proof assistant (Lean 4 assumed; Rocq interchangeable) over a candidate
+  and returns a hard verdict. This is NOT a judgement call and must never be
+  routed through an LLM. Mechanical checks, in order (cheapest first, fail fast):
+
+    C1 PARSE / TYPECHECK      the proof term elaborates without error
+    C2 NO ESCAPE HATCHES      no `sorry`, no `admit`, no new `axiom`, no
+                              `native_decide` unless whitelisted per branch
+    C3 NO CYCLES              adding this lemma keeps the dependency DAG acyclic
+    C4 HYPOTHESIS UTILIZATION every declared hypothesis is referenced in the
+                              proof term (unused hypothesis = vacuity smell)
+    C5 NON-VACUITY            hypothesis set is satisfiable — witness required,
+                              or explicit human waiver recorded in the journal
+    C6 NON-DUPLICATION        not subsumed by an existing corpus lemma above
+                              DUPLICATE_SIMILARITY_T (checked structurally, not
+                              by embedding similarity alone)
+    C7 DEPENDENCY CLOSURE     every lemma it depends on is itself VERIFIED
+
+  Fail any -> REJECT, nothing is stored, rejection is journalled with the failing
+  check ID and the full error text. Rejections are data: the Seldon Engine reads
+  them (Sec 9) and a unit's rejection pattern feeds its pathology profile.
+
+  [!] C1-C7 are exactly the checks a machine can settle. Anything requiring
+  interpretation belongs to Guardian 2 (Sec 7) and ends in the human queue.
+  Do not let the two lists blur; the moment a judgement check migrates into the
+  mechanical gate, the gate starts lying and everything above it is sand.
+
+3.2 CORPUS STORE
+  Verified lemmas, their proof terms, their dependency edges, their provenance
+  (which unit, which branch, which strategy, at which step), and their INFORMAL
+  CLAIM field (see Sec 7). The DAG is derived from the store, never stored
+  separately — one source of truth.
+
+3.3 APPEND-ONLY JOURNAL
+  Every event, forever, ordered, timestamped. The GUI's time-travel view and the
+  entire audit story depend on this being genuinely append-only.
+  Event types: BRANCH_OPENED, BRANCH_CLOSED, PHASE_CHANGE, CANDIDATE_REGISTERED,
+  GATE_PASS, GATE_REJECT, GUARDIAN2_FINDING, HUMAN_DECISION, ABSORPTION,
+  DE_ABSORPTION, FISSION, UNIT_DEATH, THETA_EVENT, STRATEGY_OUTCOME,
+  ORPHAN_FLAGGED, REFUTATION.
+
+3.4 HUMAN QUEUE
+  One prioritized list. Hard daily cap. See Sec 10.
+
+[PC]
+class ResearchSharedLib(SharedLib):
+    def __init__(self, lean_project_path, journal_db):
+        super().__init__()
+        self.verifier = LeanVerifier(lean_project_path)
+        self.corpus   = CorpusStore(journal_db)
+        self.journal  = AppendOnlyJournal(journal_db)
+        self.queue    = HumanQueue(daily_cap=HUMAN_QUEUE_DAILY_CAP)
+
+    def validate_contribution(self, unit, candidate):
+        """
+        THE gate. Extends the master spec's 4-condition schizoid check with
+        mechanical verification. Order matters: verification first (cheap,
+        objective, rejects most bad candidates), unit-health second (expensive,
+        statistical). No point auditing the theta trajectory of a unit whose
+        lemma does not typecheck.
+        """
+        verdict = self.verifier.check(candidate)          # C1..C7
+        if not verdict.ok:
+            self.journal.write("GATE_REJECT", unit=unit.unit_id,
+                               candidate=candidate.id, failed=verdict.failed_check,
+                               detail=verdict.error_text)
+            return Rejection(verdict.failed_check)
+
+        # inherited 4-condition schizoid check, unchanged in substance
+        if not self._schizoid_check(unit):
+            self.journal.write("GATE_REJECT", unit=unit.unit_id,
+                               candidate=candidate.id, failed="UNIT_HEALTH")
+            self._flag_for_human_review("contribution_from_unhealthy_unit", unit)
+            return Rejection("UNIT_HEALTH")
+
+        # semantic review is ADVISORY and does not block storage; it attaches a
+        # finding and, if severe, an item in the human queue. A verified lemma
+        # with an open Guardian-2 finding is stored as VERIFIED_CONTESTED.
+        finding = GUARDIAN2.review(candidate)
+        status  = "VERIFIED_CONTESTED" if finding.severe else "VERIFIED"
+        self.corpus.store(candidate, status=status, provenance=unit.provenance())
+        self.journal.write("GATE_PASS", unit=unit.unit_id,
+                           candidate=candidate.id, status=status)
+        if finding.severe:
+            self.queue.push(HumanItem("GUARDIAN2_SEVERE", candidate, finding))
+        return Acceptance(status)
+
+    def refute(self, lemma_id, counterexample, source_unit):
+        """
+        A verified lemma is later shown wrong (almost always: the FORMAL statement
+        was fine but did not say what we meant — see statement drift, Sec 7).
+        Everything downstream of it is invalidated transitively. This is loud.
+        """
+        affected = self.corpus.transitive_dependents(lemma_id)
+        self.corpus.mark(lemma_id, status="REFUTED")
+        for d in affected:
+            self.corpus.mark(d, status="INVALIDATED")
+        self.journal.write("REFUTATION", lemma=lemma_id, n_invalidated=len(affected),
+                           by=source_unit)
+        SELDON.record_refutation(lemma_id, affected, window=SKEPTIC_BOUNTY_WINDOW)
+        self.queue.push(HumanItem("REFUTATION", lemma_id, affected), priority=0)
+
+
+===============================================================================
+4. THE RESEARCH UNIT
+===============================================================================
+One unit = one branch = one line of attack. It is a standard PSE Unit
+(Core, Boundary, Organelle, Theta) with domain-specific content.
+
+  CORE SELF     mission = {state: current best known bound / open sub-goal,
+                           action: the method being applied,
+                           outcome: the improvement targeted}.
+                Written at instantiation by SHARED_LIB, never self-modified.
+                Lifespan = compute budget in steps, derived from the branch's
+                estimated depth. Reactive units (spawned to check one thing)
+                get N_max/100, per Incomplete Life.
+
+  BOUNDARY      registers CANDIDATE LEMMAS — its own, and those emitted by
+                sibling units. A candidate at the boundary is something the unit
+                is using provisionally but has not earned the right to assume.
+
+  REGISTRY      the unit's EARNED BASIS: verified, load-bearing lemmas it may
+                invoke without re-derivation. Budget 0.30 total, 0.20 single —
+                these caps now mean something concrete and useful: a unit whose
+                basis is dominated by one imported lemma is not developing a
+                method, it is decorating someone else's.
+
+  THETA         other-directed compute fraction. "Other" = the corpus, sibling
+                units' output, counterexample search against own claims.
+                "Self" = generating and pushing its own line.
+
+--- ABSORPTION CRITERION (adapted from Def 5) --------------------------------
+  A candidate is promoted to the unit's basis when ALL hold:
+    (1) STATUS == VERIFIED             (hard; VERIFIED_CONTESTED is not enough)
+    (2) residency  r >= 1000           invocations across distinct derivations,
+                                       not repeated use in one proof
+    (3) alpha >= 0.10 for >= 100 consecutive steps   (sustained load-bearing)
+    (4) contextual MI(candidate; mission) >= 0.70    (it advances THIS branch,
+                                       not merely true-and-nearby)
+    (5) NOT ORPHANED                   at least one other corpus lemma depends
+                                       on it, or it directly closes a sub-goal
+
+  [!] Condition (5) is new and is the whole defence against the Opening Spiral.
+  A unit can generate verified machinery indefinitely without ever producing
+  something another proof uses. That is exactly the schizoid failure translated
+  into mathematics: formally impeccable, relationally empty. Nothing enters a
+  basis on the strength of being true; it enters on the strength of being USED.
+
+--- THE FOUR ATTRACTORS AS SEARCH PATHOLOGIES --------------------------------
+  Same detection function as the master spec, same ordering (B, C, then S last),
+  reinterpreted. Detection is on the unit's theta series and registry growth —
+  no new machinery.
+
+  CIRCLE / NARCISSISTIC   mu high + sigma low + Grad_out/Grad_in < 0.1
+    Research meaning: the unit re-derives its own consequences. Output volume
+    high, corpus contribution ~0, cites itself. The single most common failure
+    of LLM-driven mathematics. Cheap early signal: candidates whose dependency
+    set is a subset of this unit's own prior output, repeatedly.
+    Response: forced RECON phase; if it recurs, terminate and harvest.
+
+  HELIX / BORDERLINE      sigma > 0.05 + ACF < 0.5
+    Research meaning: thrashing. Abandons an approach before it matures, adopts
+    a sibling's, abandons that. Nothing reaches CONSOLIDATION.
+    Response: budget floor per approach — cannot switch before N steps.
+
+  CLOSING SPIRAL / CODEPENDENT   mu low + sigma low + mutual absorption > 0.30
+    Research meaning: PREMATURE CONVERGENCE. Two or more units collapse onto the
+    same approach and stop being independent probes. This destroys the entire
+    point of a swarm and it looks like consensus, which is why it is missed.
+    Response: measure pairwise basis overlap (Jaccard over registries). Above
+    0.30 sustained -> forced divergence: one unit is re-missioned onto an
+    explicitly different method, or fissioned.
+
+  OPENING SPIRAL / SCHIZOID  sigma < 0.01 + |R| ~ 0 + no alpha accumulation
+    MOST DANGEROUS, as in the master spec. Research meaning: ever-growing formal
+    machinery, everything typechecks, nothing is ever used. Passes every surface
+    metric — the lemma count goes UP, which reads as progress on any naive
+    dashboard. Caught only temporally, by ORPHAN RATE and registry stagnation.
+    Detection: orphan fraction > 0.5 over >= 5000 steps, with flat sigma_theta.
+    Response: recovery is REPLACEMENT, not remediation. Harvest, retire the
+    branch, re-instantiate with a different method. Do not "encourage" it.
+
+--- BRANCH STALL -------------------------------------------------------------
+  BRANCH_STALL_STEPS (1500) with no new VERIFIED lemma triggers a stall review:
+  SHARED_LIB compares the branch's trajectory against the Seldon population
+  record for similar problem shapes and either extends budget, re-missions, or
+  terminates. Andrej sees stalls in the Fronta tab (Sec 12) and can pre-empt.
+
+
+===============================================================================
+5. GAME FORMS — RETAINED, DROPPED, ADDED
+===============================================================================
+The Bayesian posterior machinery is unchanged: uniform prior, update per
+interaction, confidence C = 1 - H(P)/log2(N), suppress output below 0.3,
+partial reset on structural discontinuity. Only the LIBRARY changes.
+
+--- RETAINED (4) -------------------------------------------------------------
+  STAG HUNT            Coordination on a shared conjecture. Two units commit to
+                       a joint approach; the payoff needs both. Collapses if one
+                       defects to a private line. theta: stable and high ACF
+                       until an abrupt dip on a doubt signal.
+                       Use: detect the dip early and force an explicit
+                       recommitment or a clean split, rather than silent drift
+                       where one unit is still assuming the other's half.
+
+  WAR OF ATTRITION     Two units pushing the same target by different methods;
+                       the question is who abandons first. theta: monotone drift
+                       up, low sigma, very high ACF, no registry growth.
+                       Use: THE most operationally valuable form here, exactly as
+                       in the clinical domain. It predicts a decision point
+                       within a computable horizon, which is a BUDGET decision.
+                       "This branch resolves or dies within 300-500 steps" is
+                       directly actionable.
+
+  SIGNALLING           Cheap vs costly signals about an approach's viability.
+                       Cheap = numerical/heuristic evidence (verified to 2^68,
+                       random-walk heuristic, density argument). Costly =
+                       a verified lemma. Both are evidence; they are not the
+                       same evidence and must not update the posterior equally.
+                       Use: weight a branch's promise by its costly-signal
+                       history. A branch producing only cheap signals for a long
+                       time is the early schizoid screening trigger, unchanged.
+                       [!] This distinction is the entire epistemic hygiene of
+                       the system. Computational verification is a cheap signal
+                       no matter how many orders of magnitude it covers.
+
+  GLOBAL GAMES         Information-sensitive: each unit acts on a private
+                       estimate of whether an approach is viable, and small
+                       public information has outsized effect. theta: sharp
+                       response to new data, high sigma, low ACF.
+                       Use: this is where a single well-placed corpus update
+                       swings the whole swarm — for good or ill. Highest
+                       leverage point, therefore highest care with what gets
+                       broadcast as corpus versus kept branch-local.
+
+--- DROPPED (7) --------------------------------------------------------------
+  Nash Substrate, Iterated PD, Chicken/Hawk-Dove, Bargaining, All-Pay Contest,
+  Correlated Equilibrium, Evolutionary/ESS at unit level.
+  Rationale: these model mixed-motive negotiation between parties with divergent
+  interests. Research units share one objective. Retaining them would have the
+  posterior fitting noise to forms that cannot occur, which degrades the
+  confidence measure for the forms that can. (ESS is not lost — it survives as
+  the swarm-level replicator dynamic in Seldon, Sec 9, where it belongs.)
+  Keep the dropped definitions in the library file, disabled, with this note.
+  If the swarm is ever opened to external/adversarial participants, re-enable.
+
+--- ADDED (1) ----------------------------------------------------------------
+  PROVER-SKEPTIC (Merlin-Arthur)
+    The structural core of research and the only ASYMMETRIC, near-zero-sum form
+    in the library. One unit generates a candidate; a designated skeptic unit is
+    paid to break it. Generation is expensive, checking is cheap — the system's
+    own operating assumption about P vs NP, made explicit as a relational form.
+
+    Roles are per-candidate, not per-unit: any unit can be skeptic for another's
+    output, and a unit is never skeptic for its own.
+
+    theta signature:
+      prover's theta_e w.r.t. the skeptic RISES sharply while a challenge is
+      open (attention forced outward onto the objection), falls on resolution.
+      skeptic's registry grows on successful refutations; a skeptic whose
+      registry never grows is rubber-stamping, and is caught by the ordinary
+      schizoid screen with no special machinery.
+
+    Payoffs (fed to Seldon as strategy fitness):
+      prover  +  on a candidate that passes gate AND survives the bounty window
+      skeptic +  on a refutation, or on a gap identified that forces a revision
+      BOTH    -  on a candidate accepted and LATER refuted within
+                 SKEPTIC_BOUNTY_WINDOW (2000 steps)
+    [!] The shared penalty is the whole design. Without it, the cheapest skeptic
+    strategy is to approve everything and collect nothing-happened credit. With
+    it, the skeptic carries real exposure on every approval. This is the one
+    place in the system where a genuinely adversarial incentive is correct and
+    healthy — and it is bounded by SHARED_LIB, which still decides.
+
+    Human-facing constraint I-4 applies unchanged: no unit ever tells Andrej
+    "we are in a Prover-Skeptic dynamic." The chat unit speaks mathematics:
+    "this lemma has an open objection about the k=2 case."
+
+
+===============================================================================
+6. GUARDIAN 1 — CYBER  (unchanged)
+===============================================================================
+Master spec Section 10, verbatim. Its mission is unaffected by this deployment:
+it defends the running system from hostile environments. It matters here only
+once the deployment is network-exposed (remote access to the daemon, published
+corpus endpoint, collaborators). Build it LAST (Sec 14, phase 8) and do not let
+its absence gate earlier phases on a single-user local machine.
+
+The only integration point: Guardian 1's threat-intel records and Guardian 2's
+findings both land in the same SHARED_LIB journal and the same human queue, so
+Andrej has one inbox, not two.
+
+
+===============================================================================
+7. GUARDIAN 2 — THE PROOF SKEPTIC  (new)
+===============================================================================
+DESIGN PRINCIPLE
+  Lean proves the theorem you WROTE, not the theorem you MEANT. Guardian 2 owns
+  the gap between those two, and nothing else. Everything mechanically decidable
+  already lives in the SHARED_LIB gate (C1-C7) and must not be duplicated here.
+
+  It is a specialized PSE Unit whose Boundary Organ registers CLAIMS instead of
+  patients or traffic. It relates to the corpus the way the Physician relates to
+  units and Guardian 1 to the environment: Physician treats sick units, Guardian
+  1 treats hostile environments, Guardian 2 treats sick claims.
+
+  [!] It has NO gate authority. It produces a finding; SHARED_LIB stores,
+  contests, or rejects; severe findings reach Andrej through the one queue.
+
+--- WHAT IT LOOKS FOR (the judgement checks) ---------------------------------
+  G1 STATEMENT DRIFT       the formal statement does not express the informal
+                           claim it was written to capture. Requires every
+                           candidate to carry an INFORMAL CLAIM field, written
+                           at candidate creation and immutable thereafter.
+                           This is the highest-value check in the system and the
+                           most common real failure.
+  G2 DEFINITIONAL SMUGGLING a definition introduced in the same unit-of-work as
+                           the lemma that needs it, where the definition quietly
+                           encodes the hard part. Signal: new definition + new
+                           lemma + the lemma is near-trivial given the definition.
+  G3 HYPOTHESIS INFLATION  hypotheses accumulate across a chain until the final
+                           statement, while true, applies to nothing of interest.
+                           Detected diachronically over the dependency path, not
+                           per-lemma — this is the temporal detection pattern,
+                           reused.
+  G4 SCOPE CREEP IN NAMING a lemma named/reported as more general than it is
+                           (affects how Andrej and other units reason about it,
+                           even though the formal content is correct).
+  G5 TRIVIAL GENERALIZATION a "new" lemma that is an existing one with a renamed
+                           variable — passes C6 structural dedup but is padding.
+  G6 CONSTANT REGRESSION   a claimed numerical improvement that is not one, or is
+                           one only under assumptions not carried in the statement.
+
+--- THE SLOW-IMPLANT ANALOGY (why this is the schizoid pattern) --------------
+  A circular or vacuously-true lemma crosses no threshold. It typechecks. It
+  accumulates residency legitimately because other proofs really do invoke it.
+  It meets the absorption criterion honestly and becomes part of a unit's basis —
+  permanent, constitutive, entangled with everything derived afterwards. By the
+  time the error surfaces, the transitive dependent set is large and expensive.
+  That is precisely the adversarial-capture profile from master spec Sec 10:
+  no alert, sustained legitimate-looking interaction, permanent entanglement.
+  Therefore Guardian 2 screening is CONTINUOUS, not triggered — it re-reviews
+  the corpus, not just new arrivals, and it prioritizes by transitive dependent
+  count (blast radius), not by recency.
+
+[PC]
+class Guardian2(PSEUnit):
+    """Boundary Organ registers CLAIMS. No gate authority; produces findings."""
+    def __init__(self, unit_id):
+        super().__init__(mission={"state":"corpus_integrity",
+                                  "action":"contest",
+                                  "outcome":"no_unearned_lemma_in_any_basis"},
+                         lifespan_max=OPEN, unit_id=unit_id, domain="math")
+
+    def review(self, candidate):
+        findings = []
+        findings += self._statement_drift(candidate)        # G1
+        findings += self._definitional_smuggling(candidate) # G2
+        findings += self._hypothesis_inflation(candidate)   # G3
+        findings += self._naming_scope(candidate)           # G4
+        findings += self._trivial_generalization(candidate) # G5
+        findings += self._constant_regression(candidate)    # G6
+        f = Finding.merge(findings)
+        f.severe = any(x.kind in ("G1","G2","G6") for x in findings)
+        self.boundary.update_entity(candidate.id, self.theta.current, candidate)
+        log_event("GUARDIAN2_FINDING", candidate=candidate.id,
+                  kinds=[x.kind for x in findings], severe=f.severe)
+        return f
+
+    def sweep(self):
+        """
+        Continuous re-review of the STORED corpus, ordered by blast radius.
+        This is what catches the slow implant. Runs on idle daemon capacity.
+        """
+        for lemma in CORPUS.by_transitive_dependents(desc=True):
+            if lemma.last_reviewed_step > CORPUS.now() - SWEEP_INTERVAL:
+                continue
+            f = self.review(lemma)
+            if f.severe:
+                SHARED_LIB.queue.push(HumanItem("CORPUS_CONTEST", lemma, f),
+                                      priority=blast_radius(lemma))
+
+    def self_check(self):
+        # Guardian 2 is a PSE unit and can go pathological like any other.
+        #   SCHIZOID G2   : approves everything, registry never grows -> rubber
+        #                   stamp. Same detection as any schizoid unit.
+        #   NARCISSISTIC G2: manufactures objections to justify itself; findings
+        #                   rate high, human-upheld rate low.
+        # The upheld-rate is the discriminator and requires no new machinery:
+        # it is val(B) from PVP, computed against HUMAN_DECISION journal events.
+        if self.upheld_rate(window=200) < 0.15: flag("guardian2_crying_wolf")
+        if PathologyType(self) == "SCHIZOID":   flag("guardian2_rubber_stamp")
+
+
+===============================================================================
+8. PHYSICIAN  (scope extended)
+===============================================================================
+Unchanged in mechanism (master spec Sec 8). Its patient population now includes
+research units, Guardian 1, and Guardian 2. Boundary Reset remains the primary
+tool: clearing accumulated pathological boundary content without touching Core,
+Registry, or theta directly.
+
+One domain note: for a research unit, Boundary Reset means clearing the
+provisional candidate set — the half-believed claims it is carrying — WITHOUT
+touching its earned basis. That is a genuinely useful operation and maps to
+something a human researcher does after a bad week.
+
+
+===============================================================================
+9. SELDON ENGINE  (research configuration)
+===============================================================================
+Unchanged mechanism. What changes is what fills the population record.
+
+  Population record entry:
+    {problem shape, branch method, phase profile, game-form distribution,
+     verified lemmas produced, orphan rate, refutations, outcome}
+
+  Replicator dynamic over (method, problem-shape) pairs, with the master spec's
+  conservatism: no weight shift beyond 5% before MIN_CASES_FOR_STRATEGY_SHIFT
+  (20) observations. In this domain 20 branches is a LOT of wall-clock time, so
+  expect Seldon to contribute nothing useful for months. That is correct and
+  expected — build it last among the intelligence components (phase 7), and do
+  not tune anything on 3 data points.
+
+  REJECTIONS AND REFUTATIONS ARE FITNESS DATA, not noise. A method that produces
+  many gate-rejects is not necessarily bad (aggressive conjecturing has value if
+  the survivors are strong); a method that produces many post-acceptance
+  REFUTATIONS is actively dangerous, because those cost transitive invalidation.
+  Weight the two differently: reject = -1, refutation = -(1 + blast_radius).
+
+  The attractor-correspondence analyser (Psi) keeps its master-spec status:
+  correspondences are HYPOTHESES only (I-14). Do not act on them automatically.
+
+
+===============================================================================
+10. HUMAN QUEUE  (the A5 mechanism)
+===============================================================================
+One list. One entry point. Hard daily cap of HUMAN_QUEUE_DAILY_CAP (12).
+
+  Item types, in default priority order:
+    0  REFUTATION            a stored lemma broke; dependents invalidated
+    1  GUARDIAN2_SEVERE      G1/G2/G6 finding on a new candidate
+    2  CORPUS_CONTEST        sweep finding on a stored lemma, ordered by blast
+    3  ABSORPTION_CONFIRM    candidate meets the absorption criterion
+    4  BRANCH_STALL          budget decision needed
+    5  CONFLICT              two units' claims are inconsistent
+    6  TIER2                 Guardian 1 quarantine authorization
+
+  [!] When the cap is hit, items are NOT dropped — they are deferred and the
+  system records that it exceeded Andrej's attention budget. A persistent
+  overflow is a system pathology (it means the swarm is generating more
+  uncertainty than it resolves) and is itself surfaced as a single queue item.
+  This is Human Priority with teeth: the constraint binds the swarm, not the
+  human.
+
+  Every item carries: what happened, what it affects, what a decision costs,
+  and a default action if deferred past a horizon. Never present a decision
+  without its blast radius.
+
+
+===============================================================================
+11. CHAT UNIT  (human-facing)
+===============================================================================
+The chat panel is a PSE Unit, not a text box wired to a model.
+
+  THETA        [25.00, 35.00], nominal 30.00, NEVER varies by phase. This is the
+               one place the original 70/30 applies in its psychological sense,
+               because there is an actual relationship here. It is retained
+               exactly, per the human-facing invariant.
+  BOUNDARY     registers ANDREJ. Over months its registry accumulates: which
+               branches he cares about, which questions he re-asks (pre-compute
+               those), which findings he consistently overrules (that is data
+               about Guardian 2's calibration, and should flow to it).
+  AUTHORITY    READ-ONLY over SHARED_LIB. Absolutely. It may push an item to the
+               human queue on request; it may never write to the corpus, never
+               approve, never re-mission a unit. [!] The moment the chat can
+               write, there is a second gate and it is the least supervised one
+               in the system.
+
+--- HOW IT ANSWERS "WHERE IS THE EXPERIMENT" ---------------------------------
+  NOT by dumping context into a model. A fixed set of QUERY PRIMITIVES returns
+  structured data; the LLM only PHRASES it. This is PSELGenerator from the master
+  spec, unchanged in shape: structured input -> natural language out, generator
+  invents nothing.
+
+    frontier_state()                 live branches, phase, theta, budget, horizon
+    diff_since(t)                    everything that changed since timestamp t
+    branch_history(branch_id)        phases, candidates, gate results, deaths
+    why_dropped(branch_id)           the stall/kill decision and its evidence
+    lemma(id)                        statement, informal claim, status, provenance
+    dependencies(id) / dependents(id)
+    orphans()                        verified, unused — the opening-spiral view
+    pending_for_human()              the queue
+    unit_health(unit_id)             theta series, pathology flags, registry growth
+    budget_report()                  spend by branch, by method
+    corpus_stats()                   counts by status, refutation rate
+
+--- HARD RULES ---------------------------------------------------------------
+  R1 FRESHNESS STAMP on every answer. "State as of 4 minutes ago; 2 branches
+     mid-step." Agents run while he reads; a confident stale answer is worse
+     than none.
+  R2 REGISTER SEPARATION. A conjectural result is NEVER stated in the same
+     register as a verified one. Inline status marker on every claim. Prose is
+     exactly where this distinction dissolves, and it dissolves smoothly, which
+     is why it needs a mechanical rule and not good intentions. Same principle
+     as shape-not-colour in the graph.
+  R3 I DON'T KNOW is a valid answer and must be reachable. If no query primitive
+     covers the question, say so; do not have the model improvise from the
+     corpus it can see.
+  R4 I-4/I-5 UNCHANGED: no strategic naming, domain language only. It says
+     "this branch will resolve or die within ~400 steps", never "war of
+     attrition".
+  R5 CITATIONS ARE CHIPS. Every lemma ID in an answer is clickable and drives
+     the graph view. Without this the panel is a wall of text next to a diagram
+     in which he must hunt manually for what was just described.
+
+
+===============================================================================
+12. GUI
+===============================================================================
+PySide6. Development on the Surface (Linux Mint); deployment on the Dell i7,
+16 GB. Layout must remain usable at ~1280 logical width.
+
+  +----------------------------------------------+-------------+
+  | * swarm: 3 active   sync 04:12   ! 2 pending  |             |
+  +----------------------------------------------+   CHAT      |
+  | [Overview][Graph][Frontier][Queue 2][Lean]    |   25%       |
+  +----------------------------------------------+             |
+  |                                              |  as of:     |
+  |              active tab                      |  4 min ago  |
+  |                                              |             |
+  +----------------------------------------------+             |
+  | th ###__ u1   _____ u2 !   ##_#_ u3           |  [input]    |
+  +----------------------------------------------+-------------+
+
+  QSplitter for the 75/25 split, ratio persisted. QTabWidget for the main area.
+  Chat collapsible on F9 (the Surface needs this; the Dell will not).
+
+  STATUS BAR (always visible, outside the chat)
+    Swarm liveness, time since last daemon sync, pending-queue count. Whether it
+    is running must never require asking. The chat is for WHY, not for WHETHER.
+
+  TAB 1 — OVERVIEW  (landing tab; the most-used screen)
+    Diff since last session, five sections: newly verified / refuted / new
+    branches / closed branches / awaiting you. Every row clickable, jumps to its
+    place. He works in bursts; this is the screen that makes bursts viable.
+
+  TAB 2 — GRAPH
+    The lemma DAG, QGraphicsView (native, light — not an embedded web view).
+    Layout computed offline via graphviz, scene rendered from the result.
+    [!] STATUS IS CARRIED BY SHAPE, NOT ONLY COLOUR:
+        verified = solid box, conjectural = dashed box, contested = double
+        border, refuted = struck through, orphan = hollow.
+        At 3am colour is missed; shape is not. This is the single most important
+        visual rule in the application.
+    Bottom: journal time-scrubber. Drag back and watch the branch grow.
+    Filters: by branch, by status; toggle to highlight orphans only.
+
+  TAB 3 — FRONTIER
+    Table: branch | unit | phase | theta | spent/budget | decision horizon |
+    last movement. Right-click: kill / extend budget / freeze / re-mission.
+    Sort by last-movement and stalls surface immediately.
+
+  TAB 4 — QUEUE
+    The single human queue, count badge on the tab. Each item: type, node,
+    finding, blast radius, [accept] [reject] [defer]. Guardian 2 findings show
+    the specific objection in mathematical language, not a score.
+
+  TAB 5 — LEAN
+    Workspace-confined file tree (same containment rule as the PSE IDE: read and
+    write only inside the opened workspace), editor, error pane. Largest code
+    reuse opportunity from the IDE project.
+
+  THETA STRIP  (persistent, below the tabs, NOT inside them)
+    One sparkline per live unit. A flatlined unit must be visible regardless of
+    which tab is open. Click opens that unit's detail.
+
+  CHAT PANEL (25%, right, full height)
+    Freshness stamp at top, history, input. Lemma IDs render as chips.
+
+
+===============================================================================
+13. PROCESS ARCHITECTURE & DEPLOYMENT
+===============================================================================
+  DAEMON        pse-researchd. Holds the swarm, runs the verifier, owns the
+                journal. Runs whether or not the GUI is open — this is not
+                optional, since branches run for hours and the machine is used
+                for other things.
+                systemd user service on the Dell. Local Unix domain socket.
+  GUI           attaches to the daemon over the socket. A pure client. It may
+                request, never mutate corpus state directly.
+  REPLAY MODE   [!] the GUI can attach to a RECORDED JOURNAL instead of a live
+                daemon. Non-negotiable, because the Surface cannot run the swarm
+                and you cannot develop an interface you cannot launch. Build it
+                in phase 3, not as an afterthought.
+  STORAGE       SQLite, WAL mode, for the journal and corpus metadata. Proof
+                terms live as real files inside a real Lean project on disk —
+                the corpus store indexes them, it does not own them. This keeps
+                the mathematics usable outside the system (in an editor, in git,
+                by a collaborator) which matters for eventual publication.
+  MODELS        local llama.cpp embedded (same approach as the PSE IDE, not
+                Ollama), with optional API backends for heavier generation.
+                16 GB on the Dell means: small local model for routine phrasing
+                and triage, remote calls reserved for candidate generation.
+                Budget accounting must treat a remote call as a costed action
+                so budget numbers mean something.
+  GIT           the Lean project is a git repo. Every GATE_PASS is a commit.
+                The journal references commit hashes. Free reproducibility, and
+                the corpus survives the system being rewritten.
+
+
+===============================================================================
+14. BUILD ORDER  (with acceptance criteria)
+===============================================================================
+Each phase must meet its criterion before the next begins. The temptation will
+be to build phase 4 early because it is the interesting one. Resist it: every
+phase above a leaky gate is wasted work that looks like progress, which is
+itself the opening-spiral failure, performed by you rather than by the swarm.
+
+  PHASE 1  JOURNAL + SHARED_LIB SKELETON + VERIFICATION GATE
+    No agents. A CLI pushes a candidate by hand; the gate accepts or rejects.
+    ACCEPT WHEN: all of C1-C7 demonstrably fire on hand-built adversarial
+    examples — a lemma with `sorry`, one with an unused hypothesis, one with
+    vacuous hypotheses, one creating a cycle, one duplicating an existing lemma,
+    one depending on an unverified lemma. Every rejection correctly journalled
+    with its check ID. THIS IS THE FOUNDATION; if it leaks, everything above it
+    is sand and you will not find out for three months.
+
+  PHASE 2  ONE UNIT, ONE BRANCH
+    A single research unit with a real mission on a real sub-problem. Theta is
+    MEASURED and journalled but drives nothing. Registry, absorption criterion,
+    orphan flagging active.
+    ACCEPT WHEN: the unit produces at least one lemma that passes the gate, and
+    the journal shows a coherent theta trajectory with sigma in a plausible band.
+
+  PHASE 3  GUI IN REPLAY MODE
+    Built against the journal from phases 1-2. Overview, Graph, Lean tabs first;
+    Frontier and Queue are stubs.
+    ACCEPT WHEN: you can reconstruct, from the GUI alone, what happened in phase
+    2 — without reading the database.
+
+  PHASE 4  SWARM
+    Multiple units, PVP, phase transitions, fission, sibling-candidate exchange
+    at the boundary, pathology detection with real responses (forced RECON,
+    divergence on basis overlap, termination).
+    ACCEPT WHEN: a deliberately induced Closing Spiral (two units seeded on the
+    same method) is detected by basis-overlap monitoring and forcibly diverged;
+    and an induced Circle (a unit fed only its own output) is detected and
+    terminated. If the detectors cannot catch failures you PLANTED, they will
+    not catch the ones you did not.
+
+  PHASE 5  GUARDIAN 2
+    All six judgement checks; the continuous corpus sweep ordered by blast
+    radius; the human queue populated for real.
+    ACCEPT WHEN: G1 (statement drift) catches a lemma you deliberately
+    mis-formalized, and the sweep re-surfaces a bad lemma that was stored
+    earlier and has since acquired dependents.
+
+  PHASE 6  CHAT UNIT
+    Query primitives first, phrasing layer second. Read-only enforced at the
+    socket level, not by convention.
+    ACCEPT WHEN: it answers "where is branch X" correctly with a freshness
+    stamp; correctly answers "I don't know" for a question no primitive covers;
+    and never states a conjectural result without its marker across a
+    deliberately adversarial set of 20 questions.
+
+  PHASE 7  SELDON
+    Population record, replicator dynamic, strategy fitness including the
+    reject/refutation weighting.
+    ACCEPT WHEN: it has >= 20 closed branches and its top-weighted strategy for
+    a known problem shape matches your own judgement — or, if it disagrees, the
+    disagreement is interesting rather than obviously wrong.
+
+  PHASE 8  GUARDIAN 1
+    Only when the deployment is exposed beyond the local machine.
+
+
+===============================================================================
+15. PILOT  (first real target)
+===============================================================================
+BOUNDED GAPS BETWEEN PRIMES — not Riemann, not Collatz, for the pilot.
+
+  Why: there is documented precedent that the relevant search space is
+  machine-searchable and that distributed search over it produces real
+  improvement (the Polymath8 effort was, in substance, an optimization over
+  sieve parameters and admissible tuples, and it moved the bound from 70 million
+  to 246). The objective is numerical and checkable, the sub-results are
+  formalizable, and partial progress is publishable.
+
+  Concrete branch structure for the pilot swarm:
+    B1  admissible tuple search / narrow admissible k-tuples
+    B2  Maynard-Tao style sieve weight optimization for fixed k
+    B3  formalization of the existing chain in Lean (unglamorous, high value —
+        it is the substrate every other branch needs and it is exactly the work
+        a machine should do)
+    B4  BARRIER MAPPING: which weight families provably cannot close the gap.
+        This is the branch most likely to produce the first real contribution.
+
+  Calibration test before trusting ANY new result [!]:
+  the system must independently re-derive a KNOWN result end to end — gate,
+  Guardian 2, absorption, the lot — before a single novel claim is taken
+  seriously. If it cannot reproduce what is known, its novelty is noise.
+
+  Collatz is the natural second target (search over auxiliary/weight functions
+  in the style of the logarithmic-density approach). Riemann is not a target for
+  this system; at most it contributes zero-free-region computation and
+  statistical work, which is compute, not insight.
+
+
+===============================================================================
+16. FAILURE MODES & STOP CONDITIONS
+===============================================================================
+  F1 CORPUS POLLUTION. The gate leaks and the corpus fills with plausible
+     falsehoods. Signal: refutation rate rising, blast radius growing.
+     STOP CONDITION: refutation rate > 5% of stored lemmas -> halt intake,
+     full Guardian 2 sweep, do not resume until the cause is found.
+
+  F2 ORPHAN FARM. Everything verifies, nothing connects. Signal: orphan
+     fraction > 0.5 sustained. This is the system's own opening spiral and it
+     will FEEL like productivity — the lemma count climbs.
+     RESPONSE: it is a mission problem, not an effort problem. Re-mission
+     against sub-goals with explicit consumers.
+
+  F3 ATTENTION OVERFLOW. Queue permanently at cap. The swarm generates more
+     uncertainty than it resolves; you become its bottleneck and it becomes a
+     job rather than an assistant. This is an A5 violation.
+     RESPONSE: raise Guardian 2's severity threshold, widen absorption windows,
+     reduce live branches. Fewer branches that finish beat more that hover.
+
+  F4 BENCHMARK SELF-DECEPTION. Measuring lemma count instead of dependent count.
+     Never put a raw lemma counter anywhere in the GUI. Count LOAD-BEARING
+     lemmas — that is the number that cannot be gamed by generating machinery.
+
+  F5 THE HONEST NULL. After the pilot, the system may simply have produced
+     nothing beyond a formalized restatement of known work. That is a real
+     outcome and worth recording as one. The formalization itself has value; the
+     search record has value; do not let sunk cost convert a null into a
+     narrative.
+
+
+===============================================================================
+INVARIANT QUICK-REFERENCE  (this deployment)
+===============================================================================
+  ONE GATE            only SHARED_LIB accepts or rejects; everything else
+                      produces evidence
+  VERIFICATION FIRST  nothing is stored that has not typechecked
+  MECHANICAL/SEMANTIC mechanical checks in the gate, judgement checks in
+                      Guardian 2; the two lists never blur
+  SIGMA INVARIANT     sigma_theta in [0.015, 0.03] in every phase; flatline is
+                      dead search regardless of the mean
+  USE, NOT TRUTH      nothing enters a basis for being true; only for being used
+  CHEAP != COSTLY     computational evidence never updates the posterior like a
+                      verified lemma
+  SHARED PENALTY      prover and skeptic both pay for a late refutation
+  READ-ONLY CHAT      the human-facing unit never writes
+  REGISTER SEPARATION conjectural and verified are never stated alike
+  SHAPE NOT COLOUR    graph status is carried by shape
+  ONE INBOX           every human decision arrives in one capped queue
+  I-4 / I-5           no strategic naming to a human; domain language only
+  BLAST RADIUS FIRST  no decision is presented without what it affects
+
+===============================================================================
+END
+===============================================================================

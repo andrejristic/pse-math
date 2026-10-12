@@ -1,0 +1,13 @@
+{
+  "id": "L_infinitude_scaffold",
+  "name": "placeholder_true",
+  "informal_claim": "A trivially true placeholder lemma used to smoke-test the gate end to end.",
+  "statement": "theorem L_infinitude_scaffold : True := by trivial",
+  "proof_text": "by trivial",
+  "structural_key": "SK_true_placeholder",
+  "hypotheses": [],
+  "used_hypotheses": [],
+  "dependencies": [],
+  "branch": "B3",
+  "step": 1
+}

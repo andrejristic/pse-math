@@ -1,0 +1,13 @@
+{
+  "id": "L_bad_sorry",
+  "name": "cheats_with_sorry",
+  "informal_claim": "Claims something but discharges the proof with sorry.",
+  "statement": "theorem L_bad_sorry : HardThing := by sorry",
+  "proof_text": "by sorry",
+  "structural_key": "SK_bad_sorry",
+  "hypotheses": [],
+  "used_hypotheses": [],
+  "dependencies": [],
+  "branch": "B3",
+  "step": 2
+}

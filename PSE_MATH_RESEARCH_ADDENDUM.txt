@@ -1,0 +1,381 @@
+===============================================================================
+PSE MATHEMATICAL RESEARCH SYSTEM — ADDENDUM A
+Knowledge ingestion, human-decision reports, and outward gap hypotheses
+Andrej Ristic / ZeravaTech Inc.
+Companion (delta) to: PSE_MATH_RESEARCH_BUILD.txt
+===============================================================================
+
+READING NOTE
+  This is a DELTA ON THE DELTA. It does not restate PSE_MATH_RESEARCH_BUILD.txt
+  or the master architecture. It specifies only THREE additions decided in
+  discussion, and where each slots into the existing build order (Sec 14 of the
+  build spec). Anything not mentioned here is inherited unchanged.
+  Sections marked [!] are easy to get wrong and expensive to reverse.
+  Sections marked [PC] are pseudocode: signatures and core logic only.
+
+  The three additions:
+    A1  KNOWLEDGE-INGESTION SERVICE   (scraper + curator, two agents)
+    A2  HUMAN-DECISION REPORT FILES   (a rendered artifact per decision)
+    A3  GAP_HYPOTHESIS                (an outward-facing finding type)
+
+  NONE of these touch the gate. The ONE GATE invariant is untouched: only
+  SHARED_LIB's C1-C7 accept a lemma into the corpus. Everything below is
+  EVIDENCE, a REPORT, or a QUEUE ITEM — never a second authority.
+
+
+===============================================================================
+0. THE ONE RULE THAT GOVERNS ALL INGESTION
+===============================================================================
+  Anything that comes from the internet is a CHEAP SIGNAL (build spec Sec 5),
+  no matter how authoritative its source. Therefore, without exception:
+
+  [!] Scraped content NEVER enters the corpus as verified. It lives in a
+      separate, clearly marked EXTERNAL-KNOWLEDGE STORE. If the swarm wants to
+      USE a scraped result, a research unit must RE-FORMALIZE and RE-PROVE it
+      through the gate (the calibration principle, build spec Sec 15). The
+      ingestion service has ZERO write access to the corpus. The moment it can
+      write, there is a second gate on the back door — refuse it.
+
+  [!] The scraper is the FIRST network-exposed surface in the whole system.
+      It pulls part of Guardian 1 (build spec phase 8) forward. This is a real,
+      unbudgeted cost, not optional. See A1.4.
+
+
+===============================================================================
+A1. KNOWLEDGE-INGESTION SERVICE  (two agents, one store, three consumers)
+===============================================================================
+  This is ONE service with TWO distinct roles inside it. The split is the
+  classic ETL seam, and it is a security seam, not just tidiness.
+
+    INTERNET                 QUARANTINE                EXTERNAL-KNOWLEDGE STORE
+   (hostile)                (local, raw)              (structured, labelled)
+       |                        |                            |
+       |  SCRAPER ------------> |  CURATOR ----------------> | --> 3 consumers
+       |  (Extract)            sandbox seam  (Transform+Load) |
+     network                                              cheap signal
+
+A1.1 SCRAPER  (= Extract)
+  Sole job: acquisition of raw material. Sources: mathlib, nLab, MathOverflow,
+  errata / retraction databases, papers. Concerns: sourcing, rate limiting,
+  provenance capture (URL, timestamp, content hash), and SANDBOXING because it
+  touches the network. It interprets NOTHING. Output lands in a QUARANTINE
+  (staging) area, untrusted.
+
+  [!] The scraper NEVER executes scraped Lean. A fetched "proof" is TEXT. It is
+      not elaborated in the main kernel — a scraped file could carry a malicious
+      tactic or a resource bomb that hangs the verifier. It is elaborated only
+      later, if a research unit knowingly proposes it as a candidate, and then it
+      goes through the checker's timeout/whitelist (build spec 3.1 + this Sec 2
+      note in the addendum discussion).
+
+A1.2 CURATOR  (= Transform + Load)
+  Works ONLY over already-fetched quarantine data — no network, therefore much
+  safer. Jobs: extract (informal claim <-> formal statement) pairs, tag
+  known-error / retraction cases, normalize into the store schema, score source
+  reliability, semantically de-duplicate, discard junk. Output: entries in the
+  external-knowledge store.
+
+  [!] Why the two are separate agents, not one:
+      - Different trust level: scraper is Guardian-1 territory (network);
+        curator is not. The quarantine seam is the security boundary — nothing
+        the scraper pulls is trusted until the curator has processed it.
+      - Different failure modes: scraper fails on sourcing / rate limits /
+        broken pages; curator fails on misclassification. Separated, each is
+        debugged and replaced independently.
+
+A1.3 THREE CONSUMERS  (all read the store, never the scraper directly)
+  1. RECON phase + C6 dedup  (STRONGEST use): "is this known / already tried?"
+     Prevents duplicate work — the entire point of the RECON->ASSAULT trigger.
+  2. GUARDIAN 2:  labelled (informal<->formal) pairs and the known-error catalog
+     feed its judgement checks (G1 statement drift above all). It becomes a
+     better TRIAGER, not an oracle; it still does not gate.
+  3. SELDON PRIOR  (WEAKEST use): literature history seeds initial (method,
+     problem-shape) weights, reducing the cold-start penalty.
+     [!] Literature records where HUMANS succeed; the swarm's edge is different
+         (closing doors / barrier mapping). The prior is biased. Use it to warm
+         the start, but Seldon's conservatism (no weight shift > 5% before 20
+         observations, build spec Sec 9) still governs the swarm's OWN data. The
+         scraped prior must not override lived experience.
+
+  The store is the single input surface — one schema, one trust rule, one place
+  to supervise.
+
+A1.4 HARD WALL TO THE GATE, AND HOOK TO GUARDIAN 1
+  - GATE: external store is READ-ONLY relative to the corpus. The only crossing
+    external -> corpus is re-formalize + re-prove through C1-C7. (Restates Sec 0.)
+  - GUARDIAN 1: the scraper requires, before build spec phase 8, at minimum:
+    sandboxed fetch process, rate limiting, provenance capture, and the
+    never-execute-scraped-Lean rule (A1.1). Guardian 1's threat-intel and this
+    intake both land in the SAME journal and the SAME human queue (build spec
+    Sec 6) — one inbox.
+
+[PC]
+class KnowledgeIngestion:
+    """Two agents; corpus-write disabled at construction, not by convention."""
+    def __init__(self, quarantine_dir, external_store, guardian1):
+        self.scraper = Scraper(quarantine_dir, sandbox=guardian1.sandbox,
+                               rate_limit=True, capture_provenance=True)
+        self.curator = Curator(external_store)      # no network handle at all
+        self.external = external_store              # READ-ONLY vs corpus
+        assert not self.external.can_write_corpus() # structural, not a comment
+
+    def cycle(self):
+        raw = self.scraper.fetch_next()             # -> quarantine, untrusted
+        if raw is None: return
+        entries = self.curator.process(raw)         # extract, tag, dedup, score
+        for e in entries:
+            e.tier = "EXTERNAL_CHEAP_SIGNAL"        # can never be VERIFIED here
+            self.external.put(e)                    # readable by 3 consumers only
+
+
+===============================================================================
+A2. HUMAN-DECISION REPORT FILES  (rendered artifact per decision)
+===============================================================================
+  Every HUMAN_DECISION already lands in the append-only journal (SQLite = the
+  machine's source of truth). This adds a HUMAN-READABLE report FILE on disk per
+  decision — the same philosophy the build spec applies to proof terms: they
+  "live as real files in a real Lean project" so the mathematics stays usable
+  outside the system and survives the system being rewritten. Same for decisions.
+
+  FORMAT     markdown (optionally rendered to PDF), one file per decision.
+  BINDING    tied to the GATE_PASS commit hash (build spec Sec 13: every
+             GATE_PASS is a commit) so the decision is reproducible and
+             git-diffable.
+  CONTENT    what was decided; statement + informal claim; blast radius; the
+             evidence/findings you saw; your verdict. Dismissals ("budalastina"
+             on a GAP_HYPOTHESIS, A3) are recorded too — a dismissal is data.
+  HIDDEN VALUE
+             the accumulated reports ARE the calibration dataset. Your
+             approvals/overrules are exactly the training signal that tunes
+             Guardian 2 and the gap detector over time (upheld-rate = val(B),
+             build spec Sec 7 / this Sec A3.5). The file is not just audit
+             decoration; it closes the learning loop and is the publication trail.
+
+  [!] The report file is a DERIVED artifact from the journal, NOT a second source
+      of truth. If the two ever diverge, the journal wins and regenerates the
+      file. Otherwise you have two versions of history.
+
+
+===============================================================================
+A3. GAP_HYPOTHESIS  (an outward-facing finding type)
+===============================================================================
+  WHAT IT IS
+    A Guardian-2 finding turned OUTWARD. Guardian 2 looks inward ("is this stored
+    lemma sick?"). A GAP_HYPOTHESIS looks at the frontier of the problem ("is
+    there a hole here worth attacking?"). It is CONJECTURAL by construction and
+    NEVER touches the corpus — there is nothing to typecheck. It lives only in
+    the journal and the human queue. This is what distinguishes it from a
+    candidate lemma: it is a claim that something is UNPROVEN / UNCOVERED, not a
+    claim to be proven.
+
+  This upgrades Honest Null (build spec F5) from passive ("record the null, don't
+  narrate it") to ACTIVE: the system classifies the known AND says where it
+  believes a hole is, then waits for a human verdict. It is deliverable (c) — the
+  machine-mapped barrier — made interactive.
+
+A3.1 WHERE IT IS BORN  (sources, most-honest first)
+  B4  BARRIER MAPPING (primary): B4 proves "weight family F provably cannot
+      reach the target." That proof DEFINES a gap: what F does not cover and is
+      not excluded (e.g. "F fails, but F' is not ruled out"). The gap is F'.
+      Highest value because it arrives with a formal boundary proof, not a hunch.
+  B3  FORMALIZATION (most honest): where Lean forces informal hand-waving into
+      the open — "a lemma the literature treats as obvious does not discharge
+      trivially in Lean." This is where the machine finds real, non-obvious holes.
+  CONSOLIDATION: when a branch reconciles with the corpus and hits an uncovered
+      case ("no corpus lemma covers k=2").
+
+A3.2 WHAT IT CARRIES  (mandatory fields; without them it may not enter the queue)
+  informal_gap    what is claimed missing, in human terms (I-4: domain language,
+                  no strategic naming).
+  evidence        WHY the system thinks it is a gap — concrete: a pointer to the
+                  B4 boundary proof, an uncovered case in the DAG, or the B3
+                  hand-wave site. Mandatory.
+  register        CONJECTURAL — hard marker, never stated as fact (build spec R2).
+  blast_radius    what attacking it would unlock / what depends on it. No item
+                  reaches the human without its blast radius.
+  default_action  what happens if it is not looked at by a horizon (usually
+                  "archive as un-investigated", NOT "open a branch").
+  provenance      which branch, which step, which proof produced it.
+
+A3.3 TWO CHEAP PRODUCER-SIDE FILTERS  (A5 protection; reuse existing machinery)
+  A GAP_HYPOTHESIS does NOT go straight to the human. It passes:
+    1. OUTWARD DEDUP (C6 reused): is the gap already covered by a corpus lemma or
+       an already-open GAP_HYPOTHESIS? If so, merge/drop silently.
+    2. PROVER-SKEPTIC reused (build spec Sec 5): before the queue, a skeptic unit
+       is PAID to break the gap — to find a known result or corpus lemma that
+       fills it. If it succeeds, the "gap" was never a gap and never cost your
+       attention. Same asymmetric form, turned outward: proposing is expensive,
+       refuting is cheap.
+  Only surviving, evidence-bearing, non-trivial hypotheses are ranked and compete
+  for the daily cap of 12 human-queue slots (build spec Sec 10).
+
+A3.4 LIFECYCLE
+    PROPOSED --dedup+skeptic--> QUEUED --(HUMAN)--> CONFIRMED --> SPAWNED
+       |                          |       |                       (branch on F')
+       | (skeptic broke it)       |       |                          |
+       v                          |       |                          v
+    DROPPED (silent, journalled)  |       +--> DISMISSED           resolved / null
+                                  |       +--> DEFERRED            (honest-null again)
+                                  v
+                          rank + A5 cap (12/day)
+
+A3.5 HUMAN VERDICT AND FEEDBACK LOOP
+  In the Queue tab the gap shows as an objection in mathematical language (not a
+  score) with its blast radius. Three actions:
+    CONFIRMED  (worth attacking): SHARED_LIB may open a NEW branch/mission aimed
+               at the gap (e.g. at F'). THIS IS THE LOOP that turns a null back
+               into new work — the system does not stop at "we reproduced the
+               known", it offers where to go next.
+    DISMISSED  ("budalastina"): recorded; NEGATIVE training signal that raises the
+               gap detector's bar.
+    DEFERRED   default_action decides its fate at the horizon.
+  Every verdict -> journal HUMAN_DECISION event + a report file (A2) bound to a
+  commit hash. Accumulated reports calibrate the detector: the upheld-rate of
+  GAP_HYPOTHESIS is the same val(B) mechanism used for Guardian 2. Low upheld-rate
+  = crying wolf -> raise the severity threshold. No new machinery (mirror of
+  guardian2_crying_wolf, build spec Sec 7 self_check).
+
+A3.6 HONEST-NULL, RESTATED
+  The set {GAP_HYPOTHESIS + your verdicts} IS the barrier map (deliverable c). The
+  null outcome is no longer defeat:
+    "Reproduced the known chain end to end. Detected 3 candidate gaps: 2 dismissed
+     as trivial (skeptic/you), 1 confirmed and opened as a B4 branch. Recorded."
+  A real, recordable, potentially publishable outcome — and exactly where the
+  swarm is strongest by design (closing doors, not opening them).
+
+  [!] A GAP_HYPOTHESIS must never drift into the corpus. It is a claim that
+      something is NOT proven. If it is ever proven, that goes through the normal
+      gate (C1-C7) like any lemma, and the hypothesis simply closes as "resolved".
+      The corpus stays clean.
+
+[PC]
+class GapHypothesis:
+    STATES = ("PROPOSED","QUEUED","CONFIRMED","SPAWNED",
+              "DISMISSED","DEFERRED","DROPPED","RESOLVED")
+
+def emit_gap(gap):                                   # from B4 / B3 / CONSOLIDATION
+    assert gap.evidence and gap.register == "CONJECTURAL" and gap.blast_radius
+    if CORPUS.covers(gap) or OPEN_GAPS.duplicate(gap):
+        return journal.write("GAP_DROPPED", gap=gap.id, reason="dedup")
+    if SKEPTIC.try_fill(gap):                         # prover-skeptic, outward
+        return journal.write("GAP_DROPPED", gap=gap.id, reason="skeptic_filled")
+    SHARED_LIB.queue.push(HumanItem("GAP_HYPOTHESIS", gap),
+                          priority=rank(gap.blast_radius))   # competes, A5 cap
+
+def on_human_verdict(gap, verdict):
+    journal.write("HUMAN_DECISION", gap=gap.id, verdict=verdict)
+    write_report_file(gap, verdict, commit=CORPUS.head_commit())   # A2
+    if   verdict == "CONFIRMED": SHARED_LIB.open_branch(target=gap)
+    elif verdict == "DISMISSED": DETECTOR.raise_bar()              # val(B) feedback
+    # DEFERRED -> default_action fires at horizon
+
+
+===============================================================================
+A4. REVISED BUILD ORDER  (where the three additions slot in)
+===============================================================================
+  The build spec's 8 phases are UNCHANGED and re-numbered NOWHERE. These
+  additions are insertions, gated by the same "each phase meets its criterion
+  before the next" rule. Phase 1 remains the foundation and the most important.
+
+  PHASE 1  JOURNAL + SHARED_LIB SKELETON + VERIFICATION GATE   [MOST IMPORTANT]
+           Unchanged. Additions touch nothing here. If it leaks, all is sand.
+  PHASE 2  ONE UNIT, ONE BRANCH                                Unchanged.
+  PHASE 3  GUI IN REPLAY MODE                                  Unchanged.
+     +A2   REPORT FILES may be added as soon as HUMAN_DECISION events exist
+           (cheap; hangs off the journal). No earlier than a human queue stub.
+  PHASE 4  SWARM
+     +A1   KNOWLEDGE-INGESTION (scraper + curator). RECON/dedup consumer is
+           needed here first. Brings network exposure -> minimal Guardian 1
+           (sandbox + provenance) pulled forward now, not at phase 8.
+  PHASE 5  GUARDIAN 2
+     +A1   curator's labelled data feeds G1 statement-drift here.
+     +A3   GAP_HYPOTHESIS end-to-end: born in B4/B3/CONSOLIDATION, filtered by
+           dedup + prover-skeptic, ranked into the one queue, calibrated by
+           your verdict. Depends on the queue (P5) and pilot's B4 branch.
+  PHASE 6  CHAT UNIT                                           See A5: narrowed
+           to a subordinate launch-guide + on-demand reporter.
+  PHASE 7  SELDON
+     +A1   scraped literature seeds the (method, problem-shape) prior. Weakest
+           consumer; still governed by the 20-observation conservatism.
+  PHASE 8  GUARDIAN 1                                          Full build here;
+           its minimal form already exists from +A1 at phase 4.
+
+
+===============================================================================
+A5. CHAT — SUBORDINATE LAUNCH-GUIDE + ON-DEMAND REPORTER  (narrows Sec 11)
+===============================================================================
+  ROLE HIERARCHY
+    Andrej (principal, A5-protected human)
+      -> research orchestration (does the mathematics)
+        -> chat unit (SUBORDINATE; narrow scope only)
+    The chat is a low-privilege helper. It has exactly TWO jobs and no third:
+      (1) GUIDE a launch,   (2) REPORT on demand.
+    It never runs research, never interferes with a running swarm, never writes.
+
+A5.1 LAUNCH IS GUIDED, NOT EXECUTED  [!]
+    Flow when Andrej wants to attack a problem (e.g. Collatz):
+      1. Andrej asks the chat: "can I work on Collatz?"
+      2. The chat ANSWERS with the concrete manual steps: which tab, which
+         control, WHAT DATA to enter. It does not act.
+      3. Andrej performs those steps himself; SHARED_LIB instantiates the unit
+         (it already writes the CORE SELF mission at instantiation, build spec
+         Sec 4). The click is the write, and it is Andrej's.
+    [!] The LLM NEVER TOUCHES THE LAUNCH — "ne dira, ne prije". This is stricter
+        than a staged confirm-button: the chat only instructs; the human acts.
+        There is no path by which the model's text becomes a launch write.
+
+A5.2 ONCE STARTED, THE CHAT OBSERVES EVERYTHING BUT NEVER INTERFERES  [!]
+    After a branch is running, the chat does NOT intercept it, inject into it, or
+    write to it — it never touches the running work. "Ne hvata smetnje" means
+    NON-INTERFERENCE, not non-observation.
+    The chat DOES watch everything and keeps Andrej continuously informed: it has
+    full read access to live state and the journal, and it always tells you what
+    the swarm is doing. It is a complete READ-ONLY OBSERVER AND INFORMER — total
+    visibility, zero write, zero interference.
+    [!] The chat is still not the SAFETY channel. Telling you what is happening is
+        not the same as acting on it. Corrective escalation is the swarm's own job
+        and lands in the QUEUE (Tab 4), where DECISIONS are made:
+          - Physician treats sick units;
+          - Guardian 2 sweep re-reviews the corpus by blast radius;
+          - the attractor detectors fire (Circle, Helix, Spirals);
+          - refutations, severe findings, stalls, and GAP_HYPOTHESIS reach Andrej
+            through the QUEUE, not through the chat.
+        The chat tells you what is happening; the queue is where you act on it.
+
+A5.3 CONTINUOUS AWARENESS, DEEPER REPORTS ON DEMAND
+    The chat always keeps Andrej aware of what is happening (live status, the
+    freshness stamp, what each branch is doing) — it does not go silent while work
+    runs. Deeper reports — a full branch history, a decision rationale — are
+    produced on demand. Separately, the A2 human-decision report FILES still
+    auto-generate on a HUMAN_DECISION (a permanent artifact, not a chat message).
+
+A5.4 INVARIANT PRESERVED, STRENGTHENED
+    READ-ONLY CHAT (build spec Sec 11) holds, and is now stronger: the chat is
+    not even a composer of writes. It is a guide + reporter. The query primitives
+    of Sec 11 remain its entire vocabulary for reporting; guidance is a fixed set
+    of "how to launch X" scripts, not free improvisation.
+
+
+===============================================================================
+INVARIANT QUICK-REFERENCE  (this addendum; extends the build spec's list)
+===============================================================================
+  CHEAP STAYS CHEAP    scraped content is a cheap signal; never corpus; re-prove
+                       to cross the wall
+  TWO AGENTS, ONE SEAM scraper (network, sandboxed) and curator (local) are split
+                       at the quarantine boundary; never merge them
+  NEVER EXECUTE SCRAPED scraped Lean is text until a unit knowingly proposes it
+  READ-ONLY EXTERNAL   the ingestion service has zero corpus-write authority
+  JOURNAL WINS         report files are derived; the journal is the source of truth
+  GAPS ARE CONJECTURAL a GAP_HYPOTHESIS is never stated as fact and never stored
+  FILTER BEFORE HUMAN  dedup + skeptic gate every gap before it costs attention
+  NULL IS A MAP        {gaps + verdicts} is the barrier map, a real deliverable
+  CHAT GUIDES ONLY     the chat instructs the launch; the human clicks; the LLM
+                       never writes a launch
+  CHAT OBSERVES ALL    the chat watches everything and always keeps Andrej
+                       informed; it never interferes and never writes
+  QUEUE IS FOR ACTION  the chat tells you what happens; corrective escalation and
+                       decisions live in the queue, not the chat
+
+===============================================================================
+END — ADDENDUM A
+===============================================================================
