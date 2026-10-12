@@ -1,0 +1,36 @@
+name: build-deb
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  deb:
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: pse-research
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -e . pyinstaller
+      - name: Build .deb
+        run: bash packaging/build_deb.sh
+      - name: Install
+        run: sudo apt-get update && sudo apt-get install -y ../dist/pse-math_*_amd64.deb
+      - name: App starts (headless)
+        run: |
+          sudo apt-get install -y xvfb libxcb-cursor0
+          export QT_QPA_PLATFORM=offscreen
+          xvfb-run -a pse-math >/tmp/app.log 2>&1 &
+          pid=$!; sleep 15
+          if kill -0 $pid 2>/dev/null; then echo running; kill $pid 2>/dev/null || true; else echo "exited early:"; cat /tmp/app.log; exit 1; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pse-math-deb
+          path: dist/*.deb

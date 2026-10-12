@@ -1,0 +1,19 @@
+[project]
+name = "pse-math"
+version = "0.1.0"
+description = "PSE Math: a PSE-governed research workbench for mathematical conjectures."
+license = "GPL-3.0-or-later"
+authors = [{ name = "Andrej Ristic" }]
+requires-python = ">=3.10"
+dependencies = ["PySide6>=6.5"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pse_research*"]
+
+[tool.setuptools.package-data]
+pse_research = ["**/*.json", "**/*.txt", "**/*.csv"]
